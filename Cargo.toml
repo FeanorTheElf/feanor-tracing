@@ -1,0 +1,17 @@
+[package]
+name = "feanor-tracing"
+version = "1.0.0"
+edition = "2024"
+authors = ["Simon Pohmann <simon@pohmann.de>"]
+
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+crate-type = ["rlib"]
+bench = true
+
+[dependencies]
+thread_local = "1.1.9"
+tracing = "0.1.44"
