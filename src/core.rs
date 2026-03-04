@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicU32, AtomicUsize, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU64;
 use std::time::{Instant, Duration};
 use thread_local::ThreadLocal;
 use std::cell::Cell;
@@ -134,8 +134,8 @@ impl AtomicSpanState {
 
 struct SpanData<T> {
     data: T,
-    id: NonZeroUsize,
-    parent_id: Option<NonZeroUsize>,
+    id: NonZeroU64,
+    parent_id: Option<NonZeroU64>,
     state: AtomicSpanState,
     /// accumulated messages; these will be printed as soon as state goes from
     /// [`SpanState::SilentPeriod`] to [`SpanState::PermissionAcquired`]
@@ -143,12 +143,12 @@ struct SpanData<T> {
     /// the time that the last thread entered this span, in microseconds since baseline;
     /// this must be zero if no thread is currently in the span
     entered_time: AtomicU64,
-    ref_counter: AtomicUsize
+    ref_counter: AtomicU64
 }
 
 impl<T> SpanData<T> {
 
-    fn new(id: NonZeroUsize, parent_id: Option<NonZeroUsize>, data: T) -> Self {
+    fn new(id: NonZeroU64, parent_id: Option<NonZeroU64>, data: T) -> Self {
         Self {
             data: data,
             id: id,
@@ -156,7 +156,7 @@ impl<T> SpanData<T> {
             entered_time: AtomicU64::new(0),
             messages: Mutex::new(Vec::new()),
             parent_id: parent_id,
-            ref_counter: AtomicUsize::new(0)
+            ref_counter: AtomicU64::new(0)
         }
     }
 
@@ -164,20 +164,20 @@ impl<T> SpanData<T> {
         &self.data
     }
 
-    fn ref_counter(&self) -> &AtomicUsize {
+    fn ref_counter(&self) -> &AtomicU64 {
         &self.ref_counter
     }
 
     fn log_queued_messages<F>(&self, forward: F)
-        where F: Copy + Fn(&str)
+        where F: Copy + Fn(String)
     {
         for message in self.messages.lock().unwrap().drain(..) {
-            forward(&message)
+            forward(message)
         }
     }
 
-    fn queue_message(&self, message: &str) {
-        self.messages.lock().unwrap().push(message.to_owned())
+    fn queue_message(&self, message: String) {
+        self.messages.lock().unwrap().push(message)
     }
 
     fn discard_queued_messages(&self) {
@@ -194,8 +194,8 @@ impl<T> SpanData<T> {
     /// [`SpanState::PermissionDenied`], but can also have a different state if another
     /// concurrent borrow_permission() was successful.
     ///
-    fn borrow_permission<F>(&self, span_map: &HashMap<NonZeroUsize, SpanData<T>>, forward: F) -> bool
-        where F: Copy + Fn(&str)
+    fn borrow_permission<F>(&self, span_map: &HashMap<NonZeroU64, SpanData<T>>, forward: F) -> bool
+        where F: Copy + Fn(String)
     {
         match self.state.get() {
             SpanState::SilentPeriod => {
@@ -230,7 +230,7 @@ impl<T> SpanData<T> {
     ///
     /// This doesn't perform any logging, use [`SpanData::send_message()`] before exiting!
     ///
-    fn exit(&self, span_map: &HashMap<NonZeroUsize, SpanData<T>>) {
+    fn exit(&self, span_map: &HashMap<NonZeroU64, SpanData<T>>) {
         self.discard_queued_messages();
         self.entered_time.store(0, SeqCst);
         match self.state.reset() {
@@ -244,8 +244,8 @@ impl<T> SpanData<T> {
         }
     }
 
-    fn send_message<F>(&self, message: &str, span_map: &HashMap<NonZeroUsize, SpanData<T>>, baseline: Instant, forward: F, silent_duration: u64)
-        where F: Copy + Fn(&str)
+    fn send_message<F>(&self, message: String, span_map: &HashMap<NonZeroU64, SpanData<T>>, baseline: Instant, forward: F, silent_duration: u64)
+        where F: Copy + Fn(String)
     {
         match self.state.get() {
             SpanState::SilentPeriod => {
@@ -262,6 +262,12 @@ impl<T> SpanData<T> {
                     }
                 } else {
                     self.queue_message(message);
+                    // in case another thread concurrently updated state but was too early
+                    // to print these messages
+                    match self.state.get() {
+                        SpanState::PermissionAcquired | SpanState::PermissionBorrowed => self.log_queued_messages(forward),
+                        SpanState::Inactive | SpanState::PermissionDenied | SpanState::SilentPeriod => {}
+                    }
                 }
             },
             SpanState::PermissionAcquired => {
@@ -278,24 +284,24 @@ impl<T> SpanData<T> {
     }
 }
 
-struct LoggerCore<T, F>
-    where F: Fn(&str)
+pub(crate) struct DelayedLoggerImpl<T, F>
+    where F: Fn(String)
 {
-    id_generator: AtomicUsize,
-    all_spans: RwLock<HashMap<NonZeroUsize, SpanData<T>>>,
-    current_id: ThreadLocal<Cell<Option<NonZeroUsize>>>,
+    id_generator: AtomicU64,
+    all_spans: RwLock<HashMap<NonZeroU64, SpanData<T>>>,
+    current_id: ThreadLocal<Cell<Option<NonZeroU64>>>,
     forward: F,
     baseline: Instant,
     silent_duration: u64
 }
 
-impl<T, F> LoggerCore<T, F>
-    where F: Fn(&str)
+impl<T, F> DelayedLoggerImpl<T, F>
+    where F: Fn(String)
 {
-    fn new(silent_duration: u64, forward: F) -> Self {
+    pub(crate) fn new(silent_duration: u64, forward: F) -> Self {
         Self {
             baseline: Instant::now() - Duration::from_micros(10),
-            id_generator: AtomicUsize::new(1),
+            id_generator: AtomicU64::new(1),
             all_spans: RwLock::new(HashMap::new()),
             current_id: ThreadLocal::new(),
             silent_duration: silent_duration,
@@ -303,16 +309,46 @@ impl<T, F> LoggerCore<T, F>
         }
     }
 
-    fn current_span(&self) -> &Cell<Option<NonZeroUsize>> {
+    pub(crate) fn current_span(&self) -> &Cell<Option<NonZeroU64>> {
         self.current_id.get_or(|| Cell::new(None))
     }
 
-    fn create_span(&self, data: T) -> NonZeroUsize {
-        return self.create_span_with_parent(data, self.current_span().get());
+    ///
+    /// Be careful about re-entrancy! Don't call other functions of this [`DelayedLogger`]
+    /// in the closure, as this might lead to deadlocks!
+    ///
+    pub(crate) fn span_data<G>(&self, id: NonZeroU64, accept: G)
+        where G: FnOnce(/* data = */ &T, /* parent id = */ Option<NonZeroU64>, /* time running = */ Duration)
+    {
+        let span_map = self.all_spans.read().unwrap();
+        let span = span_map.get(&id).unwrap();
+        let running_for = span.entered_time.load(SeqCst);
+        accept(span.data(), span.parent_id, Duration::from_micros((self.baseline.elapsed().as_micros() as u64).saturating_sub(running_for)))
     }
 
-    fn create_span_with_parent(&self, data: T, parent: Option<NonZeroUsize>) -> NonZeroUsize {
-        let id = NonZeroUsize::try_from(self.id_generator.fetch_add(1, SeqCst)).unwrap();
+    ///
+    /// Be careful about re-entrancy! Don't call other functions of this [`DelayedLogger`]
+    /// in the closure, as this might lead to deadlocks!
+    ///
+    pub(crate) fn create_span<G>(&self, create_data: G) -> NonZeroU64
+        where G: FnOnce(Option<(/* parent data = */ &T, /* parent id = */ NonZeroU64)>) -> T
+    {
+        let id = NonZeroU64::try_from(self.id_generator.fetch_add(1, SeqCst)).unwrap();
+        let mut span_map = self.all_spans.write().unwrap();
+        let (span_data, parent_id) = if let Some(parent_id) = self.current_span().get() {
+            let parent = span_map.get(&parent_id).unwrap();
+            (create_data(Some((parent.data(), parent.id))), Some(parent_id))
+        } else {
+            (create_data(None), None)
+        };
+        let span = SpanData::new(id, parent_id, span_data);
+        span.ref_counter().fetch_add(1, SeqCst);
+        span_map.insert(id, span);
+        return id;
+    }
+
+    pub(crate) fn create_span_with_parent(&self, data: T, parent: Option<NonZeroU64>) -> NonZeroU64 {
+        let id = NonZeroU64::try_from(self.id_generator.fetch_add(1, SeqCst)).unwrap();
         let mut span_map = self.all_spans.write().unwrap();
         let span = SpanData::new(id, parent, data);
         span.ref_counter().fetch_add(1, SeqCst);
@@ -320,37 +356,38 @@ impl<T, F> LoggerCore<T, F>
         return id;
     }
 
-    fn clone_span(&self, id: NonZeroUsize) {
+    pub(crate) fn clone_span(&self, id: NonZeroU64) {
         let span_map = self.all_spans.read().unwrap();
         span_map.get(&id).unwrap().ref_counter().fetch_add(1, SeqCst);
     }
 
-    fn delete_span(&self, id: NonZeroUsize) {
+    pub(crate) fn delete_span(&self, id: NonZeroU64) -> bool {
         let span_map = self.all_spans.read().unwrap();
         let last_ref = span_map.get(&id).unwrap().ref_counter().fetch_sub(1, SeqCst) == 1;
         drop(span_map);
         if last_ref {
             let mut span_map = self.all_spans.write().unwrap();
             _ = span_map.remove(&id);
+            return true;
+        } else {
+            return false;
         }
     }
 
-    fn send_message<M>(&self, message: M, span_id: NonZeroUsize)
-        where M: FnOnce(&T) -> String
-    {    
+    pub(crate) fn send_message(&self, message: String, span_id: NonZeroU64) {    
         let span_map = self.all_spans.read().unwrap();
         let span = span_map.get(&span_id).unwrap();
-        span.send_message(&message(span.data()), &*span_map, self.baseline, &self.forward, self.silent_duration);
+        span.send_message(message, &*span_map, self.baseline, &self.forward, self.silent_duration);
     }
 
-    fn enter(&self, span_id: NonZeroUsize) {
+    pub(crate) fn enter(&self, span_id: NonZeroU64) {
         let span_map = self.all_spans.read().unwrap();
         let span = span_map.get(&span_id).unwrap();
         self.current_span().set(Some(span_id));
         span.enter(self.baseline);
     }
 
-    fn exit(&self, span_id: NonZeroUsize) {
+    pub(crate) fn exit(&self, span_id: NonZeroU64) {
         let span_map = self.all_spans.read().unwrap();
         let span = span_map.get(&span_id).unwrap();
         self.current_span().set(span.parent_id);
@@ -364,114 +401,114 @@ use std::thread::sleep;
 #[test]
 fn test_spans() {
     let log = Mutex::new(Vec::new());
-    let logger = LoggerCore::new(0, |m: &str| log.lock().unwrap().push(m.to_owned()));
+    let logger = DelayedLoggerImpl::new(0, |m: String| log.lock().unwrap().push(m));
 
-    let a = logger.create_span("a");
+    let a = logger.create_span(|_| "a".to_owned());
     logger.enter(a);
-    logger.send_message(|name| format!("enter {}", name), a);
+    logger.send_message("enter a".to_owned(), a);
 
-    let b = logger.create_span("b");
+    let b = logger.create_span(|_| "b".to_owned());
     logger.enter(b);
-    logger.send_message(|name| format!("enter {}", name), b);
+    logger.send_message("enter b".to_owned(), b);
     
-    logger.send_message(|name| format!("exit {}", name), b);
+    logger.send_message("exit b".to_owned(), b);
     logger.exit(b);
     logger.delete_span(b);
 
-    logger.send_message(|name| format!("exit {}", name), a);
+    logger.send_message("exit a".to_owned(), a);
     logger.exit(a);
     logger.delete_span(a);
 
     assert_eq!(0, logger.all_spans.read().unwrap().len());
     drop(logger);
     let log = log.into_inner().unwrap();
-    assert_eq!(vec!["enter a", "enter b", "exit b", "exit a"], log);
+    assert_eq!(vec!["enter a".to_owned(), "enter b".to_owned(), "exit b".to_owned(), "exit a".to_owned()], log);
 }
 
 #[test]
 fn test_concurrent_spans() {
     let log = Mutex::new(Vec::new());
-    let logger = LoggerCore::new(0, |m: &str| log.lock().unwrap().push(m.to_owned()));
+    let logger = DelayedLoggerImpl::new(0, |m: String| log.lock().unwrap().push(m));
 
-    let a = logger.create_span("a");
+    let a = logger.create_span(|_| "a".to_owned());
     logger.enter(a);
-    logger.send_message(|name| format!("enter {}", name), a);
+    logger.send_message("enter a".to_owned(), a);
 
-    let b = logger.create_span("b");
+    let b = logger.create_span(|_| "b".to_owned());
     logger.enter(b);
-    logger.send_message(|name| format!("enter {}", name), b);
+    logger.send_message("enter b".to_owned(), b);
     
-    let c = logger.create_span_with_parent("c", Some(a));
+    let c = logger.create_span_with_parent("c".to_owned(), Some(a));
     logger.enter(c);
-    logger.send_message(|name| format!("enter {}", name), c);
+    logger.send_message("enter c".to_owned(), c);
     
-    logger.send_message(|name| format!("exit {}", name), b);
+    logger.send_message("exit b".to_owned(), b);
     logger.exit(b);
     logger.delete_span(b);
 
-    logger.send_message(|name| format!("exit {}", name), c);
+    logger.send_message("exit c".to_owned(), c);
     logger.exit(c);
     logger.delete_span(c);
     
-    let d = logger.create_span("d");
+    let d = logger.create_span(|_| "d".to_owned());
     logger.enter(d);
-    logger.send_message(|name| format!("enter {}", name), d);
+    logger.send_message("enter d".to_owned(), d);
     
-    logger.send_message(|name| format!("exit {}", name), d);
+    logger.send_message("exit d".to_owned(), d);
     logger.exit(d);
     logger.delete_span(d);
 
-    logger.send_message(|name| format!("exit {}", name), a);
+    logger.send_message("exit a".to_owned(), a);
     logger.exit(a);
     logger.delete_span(a);
 
     assert_eq!(0, logger.all_spans.read().unwrap().len());
     drop(logger);
     let log = log.into_inner().unwrap();
-    assert_eq!(vec!["enter a", "enter b", "exit b", "enter d", "exit d", "exit a"], log);
+    assert_eq!(vec!["enter a".to_owned(), "enter b".to_owned(), "exit b".to_owned(), "enter d".to_owned(), "exit d".to_owned(), "exit a".to_owned()], log);
 }
 
 #[test]
 fn test_skip_short_spans() {
     let log = Mutex::new(Vec::new());
-    let logger = LoggerCore::new(1000, |m: &str| log.lock().unwrap().push(m.to_owned()));
+    let logger = DelayedLoggerImpl::new(1000, |m: String| log.lock().unwrap().push(m));
 
-    let a = logger.create_span("a");
+    let a = logger.create_span(|_| "a".to_owned());
     logger.enter(a);
-    logger.send_message(|name| format!("enter {}", name), a);
+    logger.send_message("enter a".to_owned(), a);
 
-    let b = logger.create_span("b");
+    let b = logger.create_span(|_| "b".to_owned());
     logger.enter(b);
-    logger.send_message(|name| format!("enter {}", name), b);
+    logger.send_message("enter b".to_owned(), b);
     
-    let c = logger.create_span_with_parent("c", Some(a));
+    let c = logger.create_span_with_parent("c".to_owned(), Some(a));
     logger.enter(c);
-    logger.send_message(|name| format!("enter {}", name), c);
+    logger.send_message("enter c".to_owned(), c);
     
-    logger.send_message(|name| format!("exit {}", name), b);
+    logger.send_message("exit b".to_owned(), b);
     logger.exit(b);
     logger.delete_span(b);
 
     sleep(Duration::from_micros(2000));
 
-    logger.send_message(|name| format!("exit {}", name), c);
+    logger.send_message("exit c".to_owned(), c);
     logger.exit(c);
     logger.delete_span(c);
     
-    let d = logger.create_span("d");
+    let d = logger.create_span(|_| "d".to_owned());
     logger.enter(d);
-    logger.send_message(|name| format!("enter {}", name), d);
+    logger.send_message("enter d".to_owned(), d);
     
-    logger.send_message(|name| format!("exit {}", name), d);
+    logger.send_message("exit d".to_owned(), d);
     logger.exit(d);
     logger.delete_span(d);
 
-    logger.send_message(|name| format!("exit {}", name), a);
+    logger.send_message("exit a".to_owned(), a);
     logger.exit(a);
     logger.delete_span(a);
 
     assert_eq!(0, logger.all_spans.read().unwrap().len());
     drop(logger);
     let log = log.into_inner().unwrap();
-    assert_eq!(vec!["enter a", "enter c", "exit c", "exit a"], log);
+    assert_eq!(vec!["enter a".to_owned(), "enter c".to_owned(), "exit c".to_owned(), "exit a".to_owned()], log);
 }
