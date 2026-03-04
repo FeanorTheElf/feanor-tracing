@@ -198,8 +198,8 @@ impl<T> SpanData<T> {
         where F: Copy + Fn(String)
     {
         match self.state.get() {
-            SpanState::SilentPeriod => {
-                let parent = span_map.get(&self.parent_id.unwrap()).unwrap();
+            SpanState::SilentPeriod => if let Some(parent_id) = self.parent_id {
+                let parent = span_map.get(&parent_id).unwrap();
                 if parent.borrow_permission(span_map, forward) {
                     self.state.give_and_borrow_permission();
                     self.log_queued_messages(forward);
@@ -208,6 +208,10 @@ impl<T> SpanData<T> {
                     self.state.deny_permission();
                     false
                 }
+            } else {
+                self.state.give_and_borrow_permission();
+                self.log_queued_messages(forward);
+                true
             },
             SpanState::PermissionAcquired => self.state.borrow_permission(),
             SpanState::PermissionBorrowed | SpanState::PermissionDenied => false,
@@ -220,11 +224,7 @@ impl<T> SpanData<T> {
     ///
     fn enter(&self, baseline: Instant) {
         self.entered_time.store(baseline.elapsed().as_micros() as u64, SeqCst);
-        if self.parent_id.is_none() {
-            self.state.init_and_give_permission();
-        } else {
-            self.state.init();
-        }
+        self.state.init();
     }
 
     ///
@@ -252,13 +252,19 @@ impl<T> SpanData<T> {
                 let entered_time = self.entered_time.load(SeqCst);
                 let current_time = baseline.elapsed().as_micros() as u64;
                 if current_time >= silent_duration + entered_time {
-                    let parent = span_map.get(&self.parent_id.unwrap()).unwrap();
-                    if parent.borrow_permission(span_map, forward) {
+                    if let Some(parent_id) = self.parent_id {
+                        let parent = span_map.get(&parent_id).unwrap();
+                        if parent.borrow_permission(span_map, forward) {
+                            self.state.give_permission();
+                            self.log_queued_messages(forward);
+                            forward(message)
+                        } else {
+                            self.state.deny_permission();
+                        }
+                    } else {
                         self.state.give_permission();
                         self.log_queued_messages(forward);
                         forward(message)
-                    } else {
-                        self.state.deny_permission();
                     }
                 } else {
                     self.queue_message(message);
@@ -470,6 +476,62 @@ fn test_concurrent_spans() {
 
 #[test]
 fn test_skip_short_spans() {
+    let log = Mutex::new(Vec::new());
+    let logger = DelayedLoggerImpl::new(1000, |m: String| log.lock().unwrap().push(m));
+
+    let a = logger.create_span(|_| "a".to_owned());
+    logger.enter(a);
+    logger.send_message("enter a".to_owned(), a);
+
+    let b = logger.create_span(|_| "b".to_owned());
+    logger.enter(b);
+    logger.send_message("enter b".to_owned(), b);
+    
+    sleep(Duration::from_micros(100));
+    
+    logger.send_message("exit b".to_owned(), b);
+    logger.exit(b);
+    logger.delete_span(b);
+
+    logger.send_message("exit a".to_owned(), a);
+    logger.exit(a);
+    logger.delete_span(a);
+
+    assert_eq!(0, logger.all_spans.read().unwrap().len());
+    drop(logger);
+    let log = log.into_inner().unwrap();
+    assert_eq!(Vec::<String>::new(), log);
+
+
+    let log = Mutex::new(Vec::new());
+    let logger = DelayedLoggerImpl::new(1000, |m: String| log.lock().unwrap().push(m));
+
+    let a = logger.create_span(|_| "a".to_owned());
+    logger.enter(a);
+    logger.send_message("enter a".to_owned(), a);
+
+    let b = logger.create_span(|_| "b".to_owned());
+    logger.enter(b);
+    logger.send_message("enter b".to_owned(), b);
+    
+    logger.send_message("exit b".to_owned(), b);
+    logger.exit(b);
+    logger.delete_span(b);
+    
+    sleep(Duration::from_micros(2000));
+
+    logger.send_message("exit a".to_owned(), a);
+    logger.exit(a);
+    logger.delete_span(a);
+
+    assert_eq!(0, logger.all_spans.read().unwrap().len());
+    drop(logger);
+    let log = log.into_inner().unwrap();
+    assert_eq!(vec!["enter a".to_owned(), "exit a".to_owned()], log);
+}
+
+#[test]
+fn test_log_first_long_span() {
     let log = Mutex::new(Vec::new());
     let logger = DelayedLoggerImpl::new(1000, |m: String| log.lock().unwrap().push(m));
 

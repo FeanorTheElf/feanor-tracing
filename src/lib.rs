@@ -214,7 +214,9 @@ impl Subscriber for DelayedLogger {
     }
 
     fn exit(&self, span: &Id) {let mut message = None;
-        self.base.span_data(span.into_non_zero_u64(), |data, _, running_time| if data.depth <= self.max_depth {
+        self.base.span_data(span.into_non_zero_u64(), |data, _, running_time| if data.depth == 0 {
+            message = Some(format!("done({} us)\n", running_time.as_micros()));
+        } else if data.depth <= self.max_depth {
             message = Some(format!("done({} us)", running_time.as_micros()));
         });
         if let Some(message) = message {
