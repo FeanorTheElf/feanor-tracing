@@ -71,10 +71,6 @@ impl AtomicSpanState {
         assert!(self.state.swap(SpanState::SilentPeriod.into(), SeqCst) == SpanState::Inactive.into());
     }
 
-    fn init_and_give_permission(&self) {
-        assert!(self.state.swap(SpanState::PermissionAcquired.into(), SeqCst) == SpanState::Inactive.into());
-    }
-
     fn reset(&self) -> SpanState {
         SpanState::try_from(self.state.swap(SpanState::Inactive.into(), SeqCst)).unwrap()
     }
