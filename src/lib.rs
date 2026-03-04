@@ -214,7 +214,7 @@ impl Subscriber for DelayedLogger {
         if self.levels.contains(event.metadata().level()) {
             let mut is_within_depth = false;
             if let Some(span) = self.base.current_span().get() {
-                self.base.span_data(span, |data, _, _| if data.depth <= self.max_depth {
+                self.base.span_data(span, |data, _, _| if data.depth < self.max_depth {
                     is_within_depth = true;
                 });
                 if is_within_depth {
