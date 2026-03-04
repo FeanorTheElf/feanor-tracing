@@ -78,10 +78,18 @@ impl DelayedLogger {
         }
     }
     
+    ///
+    /// Creates a new [`DelayedLogger`] using [`DelayedLogger::new()`] and sets it as
+    /// the global default. This will panic if a global default has already been set.
+    ///
     pub fn init(max_depth: usize, silent_period: u64, levels: RangeInclusive<Level>) {
         tracing::subscriber::set_global_default(Self::new(max_depth, silent_period, levels)).unwrap()
     }
 
+    ///
+    /// Creates a new [`DelayedLogger`] using a test configuration and sets it as
+    /// the global default, unless a global default is already set.
+    ///
     pub fn init_test() {
         _ = tracing::subscriber::set_global_default(Self::new(4, 100000, Level::ERROR..=Level::TRACE));
     }
