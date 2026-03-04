@@ -1,6 +1,8 @@
 #![feature(unboxed_closures)]
 #![feature(fn_traits)]
 
+#![doc = include_str!("../Readme.md")]
+
 use tracing::{Id, Level, Event, span, Metadata, Subscriber};
 use tracing::subscriber::Interest;
 use tracing::field::{Field, Visit};
@@ -40,6 +42,18 @@ struct SpanData {
     metadata: &'static Metadata<'static>,
 }
 
+///
+/// A [`tracing::Subscriber`] that prints the events deemed most important to get a
+/// high-level overview of the executed algorithm to stdout.
+///
+/// Features:
+///  - Messages are only printed after the algorithm has spent a certain time in the
+///    current span, thus not printing anything for short spans
+///  - Messages are printed from the same threads as they are generated, which makes
+///    it compatible with IO capturing during tests
+///  - for each root span, all logged sub-spans and events are written in a single line,
+///    keeping the output compact.
+///
 pub struct DelayedLogger {
     base: DelayedLoggerImpl<SpanData, PrintToStdout>,
     levels: RangeInclusive<Level>,
@@ -48,6 +62,14 @@ pub struct DelayedLogger {
 
 impl DelayedLogger {
 
+    ///
+    /// Creates a new [`DelayedLogger`], which logs only events and spans
+    ///  - whose [`Level`] is within `levels`
+    ///  - which are part of a span that will be running for at least
+    ///    `silent_period` microseconds; any message queued at a time when this
+    ///    is not yet decided will be stored and possibly printed later
+    ///  - are part of a span of depth at most `max_depth` in the span tree
+    ///
     pub fn new(max_depth: usize, silent_period: u64, levels: RangeInclusive<Level>) -> Self {
         Self {
             base: DelayedLoggerImpl::new(silent_period, PrintToStdout),
@@ -172,7 +194,7 @@ impl Subscriber for DelayedLogger {
                 SpanData {
                     desc: fields,
                     metadata: span.metadata(),
-                    depth: 01
+                    depth: 0
                 }
             })
         };
@@ -190,11 +212,19 @@ impl Subscriber for DelayedLogger {
 
     fn event(&self, event: &Event<'_>) {
         if self.levels.contains(event.metadata().level()) {
-            let mut fields = FieldRecorder::new();
-            event.record(&mut fields);
-            if let Some(current_span) = self.base.current_span().get() {
-                self.base.send_message(fields.to_string(), current_span);
+            let mut is_within_depth = false;
+            if let Some(span) = self.base.current_span().get() {
+                self.base.span_data(span, |data, _, _| if data.depth <= self.max_depth {
+                    is_within_depth = true;
+                });
+                if is_within_depth {
+                    let mut fields = FieldRecorder::new();
+                    event.record(&mut fields);
+                    self.base.send_message(fields.to_string(), span);
+                }
             } else {
+                let mut fields = FieldRecorder::new();
+                event.record(&mut fields);
                 PrintToStdout(fields.to_string())
             }
         }
@@ -213,7 +243,8 @@ impl Subscriber for DelayedLogger {
         }
     }
 
-    fn exit(&self, span: &Id) {let mut message = None;
+    fn exit(&self, span: &Id) {
+        let mut message = None;
         self.base.span_data(span.into_non_zero_u64(), |data, _, running_time| if data.depth == 0 {
             message = Some(format!("done({} us)\n", running_time.as_micros()));
         } else if data.depth <= self.max_depth {

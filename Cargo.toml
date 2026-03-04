@@ -4,6 +4,13 @@ version = "1.0.0"
 edition = "2024"
 authors = ["Simon Pohmann <simon@pohmann.de>"]
 
+repository = "https://github.com/FeanorTheElf/feanor-tracing"
+homepage = "https://github.com/FeanorTheElf/feanor-tracing"
+keywords = ["tracing", "logging"]
+readme = "Readme.md"
+description = "A simple tracing subscriber that prints an overview of the current state to stdout, and ignores short or deeply nested functions."
+license = "MIT"
+
 [badges]
 maintenance = { status = "actively-developed" }
 
