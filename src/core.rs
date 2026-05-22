@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::{Mutex, RwLock};
+use std::sync::*;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::{Instant, Duration};
 use thread_local::ThreadLocal;
-use std::cell::Cell;
+use std::cell::RefCell;
 
 #[repr(u32)]
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -291,7 +291,8 @@ pub(crate) struct DelayedLoggerImpl<T, F>
 {
     id_generator: AtomicU64,
     all_spans: RwLock<HashMap<NonZeroU64, SpanData<T>>>,
-    current_id: ThreadLocal<Cell<Option<NonZeroU64>>>,
+    // deleted_spans: RwLock<HashMap<NonZeroU64, SpanData<T>>>,
+    current_id: ThreadLocal<RefCell<Vec<NonZeroU64>>>,
     forward: F,
     baseline: Instant,
     silent_duration: u64
@@ -311,8 +312,12 @@ impl<T, F> DelayedLoggerImpl<T, F>
         }
     }
 
-    pub(crate) fn current_span(&self) -> &Cell<Option<NonZeroU64>> {
-        self.current_id.get_or(|| Cell::new(None))
+    pub(crate) fn current_span(&self) -> Option<NonZeroU64> {
+        self.span_stack().borrow().last().copied()
+    }
+
+    pub(crate) fn span_stack(&self) -> &RefCell<Vec<NonZeroU64>> {
+        self.current_id.get_or(|| RefCell::new(Vec::new()))
     }
 
     ///
@@ -337,7 +342,7 @@ impl<T, F> DelayedLoggerImpl<T, F>
     {
         let id = NonZeroU64::try_from(self.id_generator.fetch_add(1, SeqCst)).unwrap();
         let mut span_map = self.all_spans.write().unwrap();
-        let (span_data, parent_id) = if let Some(parent_id) = self.current_span().get() {
+        let (span_data, parent_id) = if let Some(parent_id) = self.span_stack().borrow().last().copied() {
             let parent = span_map.get(&parent_id).unwrap();
             (create_data(Some((parent.data(), parent.id))), Some(parent_id))
         } else {
@@ -385,20 +390,20 @@ impl<T, F> DelayedLoggerImpl<T, F>
     pub(crate) fn enter(&self, span_id: NonZeroU64) {
         let span_map = self.all_spans.read().unwrap();
         let span = span_map.get(&span_id).unwrap();
-        self.current_span().set(Some(span_id));
+        self.span_stack().borrow_mut().push(span_id);
         span.enter(self.baseline);
     }
 
     pub(crate) fn exit(&self, span_id: NonZeroU64) {
         let span_map = self.all_spans.read().unwrap();
         let span = span_map.get(&span_id).unwrap();
-        self.current_span().set(span.parent_id);
+        self.span_stack().borrow_mut().pop();
         span.exit(&*span_map);
     }
 }
 
 #[cfg(test)]
-use std::thread::sleep;
+use std::thread::{sleep, spawn};
 
 #[test]
 fn test_spans() {
@@ -569,4 +574,35 @@ fn test_log_first_long_span() {
     drop(logger);
     let log = log.into_inner().unwrap();
     assert_eq!(vec!["enter a".to_owned(), "enter c".to_owned(), "exit c".to_owned(), "exit a".to_owned()], log);
+}
+
+#[test]
+fn test_span_tree_not_execution_stack() {
+    let log = Mutex::new(Vec::new());
+    let logger = Arc::new(DelayedLoggerImpl::new(1000, move |m: String| log.lock().unwrap().push(m)));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let a = logger.create_span(|_| "/a".to_owned());
+    logger.enter(a);
+    let logger_copy = logger.clone();
+    let barrier_copy = barrier.clone();
+    let helper_thread = spawn(move || {
+        let b = logger_copy.create_span_with_parent("/a/b".to_owned(), Some(a));
+        logger_copy.enter(b);
+        logger_copy.span_data(logger_copy.current_span().unwrap(), |data, _, _| assert_eq!("/a/b", data));
+        logger_copy.exit(b);
+        logger_copy.delete_span(b);
+        barrier_copy.wait();
+        barrier_copy.wait();
+        let c = logger_copy.create_span(|parent| format!("{}/c", parent.map(|(s, _)| s.as_str()).unwrap_or("")));
+        logger_copy.enter(c);
+        logger_copy.span_data(logger_copy.current_span().unwrap(), |data, _, _| assert_eq!("/c", data));
+        logger_copy.exit(c);
+        logger_copy.delete_span(c);
+    });
+    barrier.wait();
+    logger.exit(a);
+    logger.delete_span(a);
+    barrier.wait();
+    helper_thread.join().unwrap();
 }

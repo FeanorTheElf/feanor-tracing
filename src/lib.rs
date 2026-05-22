@@ -170,7 +170,7 @@ impl Subscriber for DelayedLogger {
 
     fn current_span(&self) -> tracing_core::span::Current {
         let mut result = tracing_core::span::Current::none();
-        if let Some(span) = self.base.current_span().get() {
+        if let Some(span) = self.base.span_stack().borrow().last().copied() {
             self.base.span_data(span, |data, _, _| result = 
                 tracing_core::span::Current::new(Id::from_non_zero_u64(span), data.metadata)
             );
@@ -221,7 +221,7 @@ impl Subscriber for DelayedLogger {
     fn event(&self, event: &Event<'_>) {
         if self.levels.contains(event.metadata().level()) {
             let mut is_within_depth = false;
-            if let Some(span) = self.base.current_span().get() {
+            if let Some(span) = self.base.span_stack().borrow().last().copied() {
                 self.base.span_data(span, |data, _, _| if data.depth < self.max_depth {
                     is_within_depth = true;
                 });
