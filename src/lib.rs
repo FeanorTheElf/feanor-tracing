@@ -8,9 +8,40 @@ use tracing::subscriber::Interest;
 use tracing::field::{Field, Visit};
 use std::ops::RangeInclusive;
 use std::fmt::{Display, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use owo_colors::{AnsiColors, OwoColorize, Stream};
 use core::*;
 
 mod core;
+
+///
+/// The palette of colors that is cycled through to distinguish second-level
+/// (i.e. depth-1) spans within a single line of output.
+///
+const SPAN_COLORS: [AnsiColors; 6] = [
+    AnsiColors::BrightBlue,
+    AnsiColors::BrightGreen,
+    AnsiColors::Red,
+    AnsiColors::Yellow,
+    AnsiColors::BrightCyan,
+    AnsiColors::BrightMagenta,
+];
+
+///
+/// Wraps `message` in the ANSI escape codes for the given color, if any.
+///
+/// This only emits escape codes when the output stream actually supports them; 
+/// in particular it respects whether stdout is a terminal as well as the
+/// `NO_COLOR` and `CLICOLOR` environment variables.
+///
+fn colorize(color: Option<AnsiColors>, message: String) -> String {
+    match color {
+        Some(index) => message
+            .if_supports_color(Stream::Stdout, |text| text.color(index))
+            .to_string(),
+        None => message
+    }
+}
 
 struct PrintToStdout;
 
@@ -40,6 +71,7 @@ struct SpanData {
     desc: FieldRecorder,
     depth: usize,
     metadata: &'static Metadata<'static>,
+    color: Option<AnsiColors>,
 }
 
 ///
@@ -53,11 +85,18 @@ struct SpanData {
 ///    it compatible with IO capturing during tests
 ///  - for each root span, all logged sub-spans and events are written in a single line,
 ///    keeping the output compact.
+///  - to make the single line easier to read, every second-level span (and its
+///    sub-tree) is printed in a different color, cycling through a fixed palette.
+///    Colors are only emitted when the output stream supports them, respecting
+///    the `NO_COLOR` and `CLICOLOR` conventions.
 ///
 pub struct DelayedLogger {
     base: DelayedLoggerImpl<SpanData, PrintToStdout>,
     levels: RangeInclusive<Level>,
-    max_depth: usize
+    max_depth: usize,
+    /// counter used to assign a distinct color from [`SPAN_COLORS`] to each
+    /// new second-level span, cycling through the palette
+    color_counter: AtomicUsize
 }
 
 impl DelayedLogger {
@@ -74,7 +113,22 @@ impl DelayedLogger {
         Self {
             base: DelayedLoggerImpl::new(silent_period, PrintToStdout),
             levels: levels,
-            max_depth: max_depth
+            max_depth: max_depth,
+            color_counter: AtomicUsize::new(0)
+        }
+    }
+
+    ///
+    /// Determines the color for a span at the given `depth`, whose parent span
+    /// (if any) was assigned `parent_color`.
+    ///
+    fn color_for(&self, depth: usize, parent_color: Option<AnsiColors>) -> Option<AnsiColors> {
+        if depth == 0 {
+            None
+        } else if depth == 1 {
+            Some(SPAN_COLORS[self.color_counter.fetch_add(1, Ordering::SeqCst) % SPAN_COLORS.len()])
+        } else {
+            parent_color
         }
     }
     
@@ -185,24 +239,29 @@ impl Subscriber for DelayedLogger {
 
         let id = if let Some(parent_id) = span.parent() {
             let mut depth = 0;
-            self.base.span_data(parent_id.into_non_zero_u64(), |data, _, _| depth = data.depth + 1);
+            let mut parent_color = None;
+            self.base.span_data(parent_id.into_non_zero_u64(), |data, _, _| {
+                depth = data.depth + 1;
+                parent_color = data.color;
+            });
             self.base.create_span_with_parent(SpanData {
                 desc: fields,
                 metadata: span.metadata(),
-                depth: depth
+                depth: depth,
+                color: self.color_for(depth, parent_color)
             }, Some(parent_id.into_non_zero_u64()))
         } else {
-            self.base.create_span(|parent| if let Some((parent_data, _)) = parent {
+            self.base.create_span(|parent| {
+                let (depth, parent_color) = if let Some((parent_data, _)) = parent {
+                    (parent_data.depth + 1, parent_data.color)
+                } else {
+                    (0, None)
+                };
                 SpanData {
                     desc: fields,
                     metadata: span.metadata(),
-                    depth: parent_data.depth + 1
-                }
-            } else {
-                SpanData {
-                    desc: fields,
-                    metadata: span.metadata(),
-                    depth: 0
+                    depth: depth,
+                    color: self.color_for(depth, parent_color)
                 }
             })
         };
@@ -221,14 +280,16 @@ impl Subscriber for DelayedLogger {
     fn event(&self, event: &Event<'_>) {
         if self.levels.contains(event.metadata().level()) {
             let mut is_within_depth = false;
+            let mut color = None;
             if let Some(span) = self.base.span_stack().borrow().last().copied() {
                 self.base.span_data(span, |data, _, _| if data.depth < self.max_depth {
                     is_within_depth = true;
+                    color = data.color;
                 });
                 if is_within_depth {
                     let mut fields = FieldRecorder::new();
                     event.record(&mut fields);
-                    self.base.send_message(fields.to_string(), span);
+                    self.base.send_message(colorize(color, fields.to_string()), span);
                 }
             } else {
                 let mut fields = FieldRecorder::new();
@@ -242,9 +303,9 @@ impl Subscriber for DelayedLogger {
         self.base.enter(span.into_non_zero_u64());
         let mut message = None;
         self.base.span_data(span.into_non_zero_u64(), |data, _, _| if data.depth < self.max_depth {
-            message = Some(data.desc.clone().to_string());
+            message = Some(colorize(data.color, data.desc.clone().to_string()));
         } else if data.depth == self.max_depth {
-            message = Some(format!("{}...", data.desc));
+            message = Some(colorize(data.color, format!("{}...", data.desc)));
         });
         if let Some(message) = message {
             self.base.send_message(message, span.into_non_zero_u64());
@@ -256,7 +317,7 @@ impl Subscriber for DelayedLogger {
         self.base.span_data(span.into_non_zero_u64(), |data, _, running_time| if data.depth == 0 {
             message = Some(format!("done({} us)\n", running_time.as_micros()));
         } else if data.depth <= self.max_depth {
-            message = Some(format!("done({} us)", running_time.as_micros()));
+            message = Some(colorize(data.color, format!("done({} us)", running_time.as_micros())));
         });
         if let Some(message) = message {
             self.base.send_message(message, span.into_non_zero_u64());
@@ -272,4 +333,34 @@ impl Subscriber for DelayedLogger {
     fn try_close(&self, id: Id) -> bool {
         self.base.delete_span(id.into_non_zero_u64())
     }
+}
+
+#[test]
+fn test_try_all_colors() {
+    for color in [
+        AnsiColors::Black,
+        AnsiColors::Blue,
+        AnsiColors::BrightBlack,
+        AnsiColors::BrightBlue,
+        AnsiColors::BrightCyan,
+        AnsiColors::BrightGreen,
+        AnsiColors::BrightMagenta,
+        AnsiColors::BrightRed,
+        AnsiColors::BrightWhite,
+        AnsiColors::BrightYellow,
+        AnsiColors::Cyan,
+        AnsiColors::Default,
+        AnsiColors::Green,
+        AnsiColors::Magenta,
+        AnsiColors::Red,
+        AnsiColors::White,
+        AnsiColors::Yellow,
+    ] {
+        print!("{}", colorize(Some(color), "test".to_owned()));
+    }
+    println!();
+    for color in SPAN_COLORS {
+        print!("{}", colorize(Some(color), "test".to_owned()));
+    }
+    println!();
 }
