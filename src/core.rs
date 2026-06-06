@@ -312,6 +312,7 @@ impl<T, F> DelayedLoggerImpl<T, F>
         }
     }
 
+    #[allow(unused)]
     pub(crate) fn current_span(&self) -> Option<NonZeroU64> {
         self.span_stack().borrow().last().copied()
     }

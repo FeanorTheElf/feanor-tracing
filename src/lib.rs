@@ -9,7 +9,7 @@ use tracing::field::{Field, Visit};
 use std::ops::RangeInclusive;
 use std::fmt::{Display, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use owo_colors::{OwoColorize, AnsiColors, Stream};
+use owo_colors::{AnsiColors, OwoColorize, Stream};
 use core::*;
 
 mod core;
@@ -21,8 +21,8 @@ mod core;
 const SPAN_COLORS: [AnsiColors; 6] = [
     AnsiColors::BrightBlue,
     AnsiColors::BrightGreen,
-    AnsiColors::BrightRed,
-    AnsiColors::BrightYellow,
+    AnsiColors::Red,
+    AnsiColors::Yellow,
     AnsiColors::BrightCyan,
     AnsiColors::BrightMagenta,
 ];
@@ -34,10 +34,10 @@ const SPAN_COLORS: [AnsiColors; 6] = [
 /// in particular it respects whether stdout is a terminal as well as the
 /// `NO_COLOR` and `CLICOLOR` environment variables.
 ///
-fn colorize(color: Option<usize>, message: String) -> String {
+fn colorize(color: Option<AnsiColors>, message: String) -> String {
     match color {
         Some(index) => message
-            .if_supports_color(Stream::Stdout, |text| text.color(SPAN_COLORS[index]))
+            .if_supports_color(Stream::Stdout, |text| text.color(index))
             .to_string(),
         None => message
     }
@@ -71,7 +71,7 @@ struct SpanData {
     desc: FieldRecorder,
     depth: usize,
     metadata: &'static Metadata<'static>,
-    color: Option<usize>,
+    color: Option<AnsiColors>,
 }
 
 ///
@@ -122,11 +122,11 @@ impl DelayedLogger {
     /// Determines the color for a span at the given `depth`, whose parent span
     /// (if any) was assigned `parent_color`.
     ///
-    fn color_for(&self, depth: usize, parent_color: Option<usize>) -> Option<usize> {
+    fn color_for(&self, depth: usize, parent_color: Option<AnsiColors>) -> Option<AnsiColors> {
         if depth == 0 {
             None
         } else if depth == 1 {
-            Some(self.color_counter.fetch_add(1, Ordering::SeqCst) % SPAN_COLORS.len())
+            Some(SPAN_COLORS[self.color_counter.fetch_add(1, Ordering::SeqCst) % SPAN_COLORS.len()])
         } else {
             parent_color
         }
@@ -333,4 +333,34 @@ impl Subscriber for DelayedLogger {
     fn try_close(&self, id: Id) -> bool {
         self.base.delete_span(id.into_non_zero_u64())
     }
+}
+
+#[test]
+fn test_try_all_colors() {
+    for color in [
+        AnsiColors::Black,
+        AnsiColors::Blue,
+        AnsiColors::BrightBlack,
+        AnsiColors::BrightBlue,
+        AnsiColors::BrightCyan,
+        AnsiColors::BrightGreen,
+        AnsiColors::BrightMagenta,
+        AnsiColors::BrightRed,
+        AnsiColors::BrightWhite,
+        AnsiColors::BrightYellow,
+        AnsiColors::Cyan,
+        AnsiColors::Default,
+        AnsiColors::Green,
+        AnsiColors::Magenta,
+        AnsiColors::Red,
+        AnsiColors::White,
+        AnsiColors::Yellow,
+    ] {
+        print!("{}", colorize(Some(color), "test".to_owned()));
+    }
+    println!();
+    for color in SPAN_COLORS {
+        print!("{}", colorize(Some(color), "test".to_owned()));
+    }
+    println!();
 }
