@@ -1,6 +1,6 @@
 [package]
 name = "feanor-tracing"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 authors = ["Simon Pohmann <simon@pohmann.de>"]
 
@@ -22,7 +22,11 @@ bench = true
 thread_local = "1.1.9"
 tracing = "0.1.44"
 tracing-core = "0.1.34"
-owo-colors = { version = "4", features = ["supports-colors"] }
+owo-colors = { version = "4", features = ["supports-colors"], optional = true }
+
+[features]
+default = ["print_colored"]
+print_colored = ["dep:owo-colors"]
 
 [profile.test]
 panic = "abort"

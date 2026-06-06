@@ -8,9 +8,11 @@ use tracing::subscriber::Interest;
 use tracing::field::{Field, Visit};
 use std::ops::RangeInclusive;
 use std::fmt::{Display, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use owo_colors::{AnsiColors, OwoColorize, Stream};
+use std::sync::atomic::AtomicUsize;
 use core::*;
+
+#[cfg(feature = "print_colored")]
+use owo_colors::{AnsiColors, OwoColorize, Stream};
 
 mod core;
 
@@ -18,14 +20,19 @@ mod core;
 /// The palette of colors that is cycled through to distinguish second-level
 /// (i.e. depth-1) spans within a single line of output.
 ///
+#[cfg(feature = "print_colored")]
 const SPAN_COLORS: [AnsiColors; 6] = [
     AnsiColors::BrightBlue,
-    AnsiColors::BrightGreen,
-    AnsiColors::Red,
-    AnsiColors::Yellow,
     AnsiColors::BrightCyan,
     AnsiColors::BrightMagenta,
+    AnsiColors::Yellow,
+    AnsiColors::BrightGreen,
+    AnsiColors::Red,
 ];
+
+#[cfg(not(feature = "print_colored"))]
+#[derive(Copy, Clone)]
+struct AnsiColors;
 
 ///
 /// Wraps `message` in the ANSI escape codes for the given color, if any.
@@ -36,9 +43,14 @@ const SPAN_COLORS: [AnsiColors; 6] = [
 ///
 fn colorize(color: Option<AnsiColors>, message: String) -> String {
     match color {
-        Some(index) => message
-            .if_supports_color(Stream::Stdout, |text| text.color(index))
-            .to_string(),
+        #[cfg(feature = "print_colored")]
+        Some(index) => {
+            message
+                .if_supports_color(Stream::Stdout, |text| text.color(index))
+                .to_string()
+        },
+        #[cfg(not(feature = "print_colored"))]
+        Some(_) => unreachable!(),
         None => message
     }
 }
@@ -72,6 +84,28 @@ struct SpanData {
     depth: usize,
     metadata: &'static Metadata<'static>,
     color: Option<AnsiColors>,
+    /// counter used to assign distinct colors to children; only set for
+    /// top-level spans
+    #[allow(unused)]
+    color_counter: Option<AtomicUsize>
+}
+
+impl SpanData {
+
+    #[cfg(feature = "print_colored")]
+    fn color_for_child(&self) -> Option<AnsiColors> {
+        if let Some(color_counter) = &self.color_counter {
+            debug_assert_eq!(0, self.depth);
+            Some(SPAN_COLORS[color_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % SPAN_COLORS.len()])
+        } else {
+            self.color
+        }
+    }
+
+    #[cfg(not(feature = "print_colored"))]
+    fn color_for_child(&self) -> Option<AnsiColors> {
+        None
+    }
 }
 
 ///
@@ -87,16 +121,14 @@ struct SpanData {
 ///    keeping the output compact.
 ///  - to make the single line easier to read, every second-level span (and its
 ///    sub-tree) is printed in a different color, cycling through a fixed palette.
-///    Colors are only emitted when the output stream supports them, respecting
-///    the `NO_COLOR` and `CLICOLOR` conventions.
+///    Colors are only emitted when the feature `print_colored` is active and the output
+///    stream supports them; Furthermore, they can be disabled via the the `NO_COLOR`
+///    and `CLICOLOR` environment variables.
 ///
 pub struct DelayedLogger {
     base: DelayedLoggerImpl<SpanData, PrintToStdout>,
     levels: RangeInclusive<Level>,
-    max_depth: usize,
-    /// counter used to assign a distinct color from [`SPAN_COLORS`] to each
-    /// new second-level span, cycling through the palette
-    color_counter: AtomicUsize
+    max_depth: usize
 }
 
 impl DelayedLogger {
@@ -113,22 +145,7 @@ impl DelayedLogger {
         Self {
             base: DelayedLoggerImpl::new(silent_period, PrintToStdout),
             levels: levels,
-            max_depth: max_depth,
-            color_counter: AtomicUsize::new(0)
-        }
-    }
-
-    ///
-    /// Determines the color for a span at the given `depth`, whose parent span
-    /// (if any) was assigned `parent_color`.
-    ///
-    fn color_for(&self, depth: usize, parent_color: Option<AnsiColors>) -> Option<AnsiColors> {
-        if depth == 0 {
-            None
-        } else if depth == 1 {
-            Some(SPAN_COLORS[self.color_counter.fetch_add(1, Ordering::SeqCst) % SPAN_COLORS.len()])
-        } else {
-            parent_color
+            max_depth: max_depth
         }
     }
     
@@ -239,29 +256,31 @@ impl Subscriber for DelayedLogger {
 
         let id = if let Some(parent_id) = span.parent() {
             let mut depth = 0;
-            let mut parent_color = None;
+            let mut color = None;
             self.base.span_data(parent_id.into_non_zero_u64(), |data, _, _| {
                 depth = data.depth + 1;
-                parent_color = data.color;
+                color = data.color_for_child();
             });
             self.base.create_span_with_parent(SpanData {
+                color_counter: if depth == 0 { Some(AtomicUsize::new(0)) } else { None },
                 desc: fields,
                 metadata: span.metadata(),
                 depth: depth,
-                color: self.color_for(depth, parent_color)
+                color: color
             }, Some(parent_id.into_non_zero_u64()))
         } else {
             self.base.create_span(|parent| {
-                let (depth, parent_color) = if let Some((parent_data, _)) = parent {
-                    (parent_data.depth + 1, parent_data.color)
+                let (depth, color) = if let Some((parent_data, _)) = parent {
+                    (parent_data.depth + 1, parent_data.color_for_child())
                 } else {
                     (0, None)
                 };
                 SpanData {
+                    color_counter: if depth == 0 { Some(AtomicUsize::new(0)) } else { None },
                     desc: fields,
                     metadata: span.metadata(),
                     depth: depth,
-                    color: self.color_for(depth, parent_color)
+                    color: color
                 }
             })
         };
@@ -333,34 +352,4 @@ impl Subscriber for DelayedLogger {
     fn try_close(&self, id: Id) -> bool {
         self.base.delete_span(id.into_non_zero_u64())
     }
-}
-
-#[test]
-fn test_try_all_colors() {
-    for color in [
-        AnsiColors::Black,
-        AnsiColors::Blue,
-        AnsiColors::BrightBlack,
-        AnsiColors::BrightBlue,
-        AnsiColors::BrightCyan,
-        AnsiColors::BrightGreen,
-        AnsiColors::BrightMagenta,
-        AnsiColors::BrightRed,
-        AnsiColors::BrightWhite,
-        AnsiColors::BrightYellow,
-        AnsiColors::Cyan,
-        AnsiColors::Default,
-        AnsiColors::Green,
-        AnsiColors::Magenta,
-        AnsiColors::Red,
-        AnsiColors::White,
-        AnsiColors::Yellow,
-    ] {
-        print!("{}", colorize(Some(color), "test".to_owned()));
-    }
-    println!();
-    for color in SPAN_COLORS {
-        print!("{}", colorize(Some(color), "test".to_owned()));
-    }
-    println!();
 }
