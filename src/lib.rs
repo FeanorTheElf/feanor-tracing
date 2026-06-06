@@ -16,28 +16,23 @@ mod core;
 
 ///
 /// The palette of colors that is cycled through to distinguish second-level
-/// (i.e. depth-1) spans within a single line of output. The colors were chosen
-/// to be clearly distinguishable on both light and dark terminal backgrounds,
-/// and to avoid the default foreground color (which is reserved for the
-/// top-level span).
+/// (i.e. depth-1) spans within a single line of output.
 ///
 const SPAN_COLORS: [AnsiColors; 6] = [
-    AnsiColors::Cyan,
-    AnsiColors::Yellow,
-    AnsiColors::Green,
-    AnsiColors::Magenta,
     AnsiColors::BrightBlue,
+    AnsiColors::BrightGreen,
     AnsiColors::BrightRed,
+    AnsiColors::BrightYellow,
+    AnsiColors::BrightCyan,
+    AnsiColors::BrightMagenta,
 ];
 
 ///
 /// Wraps `message` in the ANSI escape codes for the given color, if any.
 ///
-/// Following the established best practices for colored terminal output, this
-/// only emits escape codes when the output stream actually supports them; in
-/// particular it respects whether stdout is a terminal as well as the
-/// `NO_COLOR` and `CLICOLOR` environment variables. When color is not
-/// supported, or `color` is `None`, the message is returned unchanged.
+/// This only emits escape codes when the output stream actually supports them; 
+/// in particular it respects whether stdout is a terminal as well as the
+/// `NO_COLOR` and `CLICOLOR` environment variables.
 ///
 fn colorize(color: Option<usize>, message: String) -> String {
     match color {
@@ -76,8 +71,6 @@ struct SpanData {
     desc: FieldRecorder,
     depth: usize,
     metadata: &'static Metadata<'static>,
-    /// the index into [`SPAN_COLORS`] used to color this span and all its
-    /// descendants; `None` for the top-level span (which is left uncolored)
     color: Option<usize>,
 }
 
@@ -128,12 +121,6 @@ impl DelayedLogger {
     ///
     /// Determines the color for a span at the given `depth`, whose parent span
     /// (if any) was assigned `parent_color`.
-    ///
-    /// The top-level span (depth 0) is left uncolored, so that the overall line
-    /// structure is preserved. Each second-level span (depth 1) is assigned the
-    /// next color from [`SPAN_COLORS`], so that they can be told apart at a
-    /// glance. Deeper spans inherit the color of their second-level ancestor, so
-    /// that an entire sub-tree shares one color.
     ///
     fn color_for(&self, depth: usize, parent_color: Option<usize>) -> Option<usize> {
         if depth == 0 {
