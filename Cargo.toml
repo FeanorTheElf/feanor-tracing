@@ -22,6 +22,7 @@ bench = true
 thread_local = "1.1.9"
 tracing = "0.1.44"
 tracing-core = "0.1.34"
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 [profile.test]
 panic = "abort"
