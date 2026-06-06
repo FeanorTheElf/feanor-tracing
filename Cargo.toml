@@ -27,6 +27,3 @@ owo-colors = { version = "4", features = ["supports-colors"], optional = true }
 [features]
 default = ["print_colored"]
 print_colored = ["dep:owo-colors"]
-
-[profile.test]
-panic = "abort"
