@@ -9,10 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "feanor-tracing"
+name = "equivalent"
 version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "feanor-tracing"
+version = "1.0.4"
 dependencies = [
  "owo-colors",
+ "papaya",
  "thread_local",
  "tracing",
  "tracing-core",
@@ -64,6 +71,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "papaya"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae"
+dependencies = [
+ "equivalent",
+ "seize",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -85,6 +102,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "seize"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
+dependencies = [
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]

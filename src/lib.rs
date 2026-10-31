@@ -1,6 +1,3 @@
-#![feature(unboxed_closures)]
-#![feature(fn_traits)]
-
 #![doc = include_str!("../Readme.md")]
 
 use tracing::{Id, Level, Event, span, Metadata, Subscriber};
@@ -9,6 +6,7 @@ use tracing::field::{Field, Visit};
 use std::ops::RangeInclusive;
 use std::fmt::{Display, Write};
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 use core::*;
 
 #[cfg(feature = "print_colored")]
@@ -55,32 +53,40 @@ fn colorize(color: Option<AnsiColors>, message: String) -> String {
     }
 }
 
-struct PrintToStdout;
-
-impl FnOnce<(String,)> for PrintToStdout {
-    type Output = ();
-
-    extern "rust-call" fn call_once(self, args: (String,)) {
-        self.call(args)
-    }
+fn print_to_stdout(message: &str) {
+    // use print! here to interact with io capture during tests
+    print!("{}", message);
+    std::io::Write::flush(&mut std::io::stdout()).unwrap()
 }
 
-impl<'a> FnMut<(String,)> for PrintToStdout {
-    extern "rust-call" fn call_mut(&mut self, args: (String,)) {
-        self.call(args)
-    }
+///
+/// A message that is queued by a span; it is only formatted once it is clear that
+/// it will be printed.
+///
+enum Message {
+    Enter,
+    EnterTruncated,
+    Exit(Duration),
+    Event(String)
 }
 
-impl<'a> Fn<(String,)> for PrintToStdout {
-    extern "rust-call" fn call(&self, args: (String,)) {
-        // use print! here to interact with io capture during tests
-        print!("{}", args.0);
-        std::io::Write::flush(&mut std::io::stdout()).unwrap()
-    }
+fn print_message(span: &SpanData, message: Message) {
+    let text = match message {
+        Message::Enter => colorize(span.color, span.describe()),
+        Message::EnterTruncated => colorize(span.color, format!("{}...", span.describe())),
+        Message::Exit(running_time) if span.depth == 0 => format!("done({} us)\n", running_time.as_micros()),
+        Message::Exit(running_time) => colorize(span.color, format!("done({} us)", running_time.as_micros())),
+        Message::Event(text) => colorize(span.color, text)
+    };
+    print_to_stdout(&text)
 }
 
+///
+/// Data of spans of depth at most `max_depth`; deeper spans are not tracked at all.
+///
 struct SpanData {
-    desc: FieldRecorder,
+    /// the recorded fields; the span name is taken from `metadata`
+    fields: Option<String>,
     depth: usize,
     metadata: &'static Metadata<'static>,
     color: Option<AnsiColors>,
@@ -91,6 +97,14 @@ struct SpanData {
 }
 
 impl SpanData {
+
+    fn describe(&self) -> String {
+        if let Some(fields) = &self.fields {
+            format!("{}({})", self.metadata.name(), fields)
+        } else {
+            format!("{}.", self.metadata.name())
+        }
+    }
 
     #[cfg(feature = "print_colored")]
     fn color_for_child(&self) -> Option<AnsiColors> {
@@ -126,7 +140,7 @@ impl SpanData {
 ///    and `CLICOLOR` environment variables.
 ///
 pub struct DelayedLogger {
-    base: DelayedLoggerImpl<SpanData, PrintToStdout>,
+    base: DelayedLoggerImpl<SpanData, Metadata<'static>, Message, fn(&SpanData, Message)>,
     levels: RangeInclusive<Level>,
     max_depth: usize
 }
@@ -143,7 +157,7 @@ impl DelayedLogger {
     ///
     pub fn new(max_depth: usize, silent_period: u64, levels: RangeInclusive<Level>) -> Self {
         Self {
-            base: DelayedLoggerImpl::new(silent_period, PrintToStdout),
+            base: DelayedLoggerImpl::new(silent_period, print_message),
             levels: levels,
             max_depth: max_depth
         }
@@ -240,51 +254,42 @@ impl Subscriber for DelayedLogger {
     }
 
     fn current_span(&self) -> tracing_core::span::Current {
-        let mut result = tracing_core::span::Current::none();
-        if let Some(span) = self.base.span_stack().borrow().last().copied() {
-            self.base.span_data(span, |data, _, _| result = 
-                tracing_core::span::Current::new(Id::from_non_zero_u64(span), data.metadata)
-            );
+        if let Some(span) = self.base.current_span() {
+            let metadata = self.base.with_span(span, |span| match span {
+                SpanView::Tracked(data) => data.metadata,
+                SpanView::Ignored(metadata) => metadata
+            });
+            tracing_core::span::Current::new(Id::from_non_zero_u64(span), metadata)
+        } else {
+            tracing_core::span::Current::none()
         }
-        return result;
     }
 
     fn new_span(&self, span: &span::Attributes<'_>) -> Id {
-        let mut fields = FieldRecorder::new();
-        span.record(&mut fields);
-        fields.message = Some(span.metadata().name().to_owned());
-
-        let id = if let Some(parent_id) = span.parent() {
-            let mut depth = 0;
-            let mut color = None;
-            self.base.span_data(parent_id.into_non_zero_u64(), |data, _, _| {
-                depth = data.depth + 1;
-                color = data.color_for_child();
-            });
-            self.base.create_span_with_parent(SpanData {
+        let parent = if let Some(parent_id) = span.parent() {
+            Some(parent_id.into_non_zero_u64())
+        } else if span.is_contextual() {
+            self.base.current_span()
+        } else {
+            None
+        };
+        let id = self.base.create_span(parent, |parent| {
+            let (depth, color) = match parent {
+                ParentData::Root => (0, None),
+                ParentData::Tracked(parent_data) if parent_data.depth < self.max_depth => (parent_data.depth + 1, parent_data.color_for_child()),
+                // spans deeper than `max_depth` never print anything, so don't track them
+                ParentData::Tracked(_) | ParentData::Ignored => return NewSpan::Ignored(span.metadata())
+            };
+            let mut fields = FieldRecorder::new();
+            span.record(&mut fields);
+            NewSpan::Tracked(SpanData {
                 color_counter: if depth == 0 { Some(AtomicUsize::new(0)) } else { None },
-                desc: fields,
+                fields: fields.fields,
                 metadata: span.metadata(),
                 depth: depth,
                 color: color
-            }, Some(parent_id.into_non_zero_u64()))
-        } else {
-            self.base.create_span(|parent| {
-                let (depth, color) = if let Some((parent_data, _)) = parent {
-                    (parent_data.depth + 1, parent_data.color_for_child())
-                } else {
-                    (0, None)
-                };
-                SpanData {
-                    color_counter: if depth == 0 { Some(AtomicUsize::new(0)) } else { None },
-                    desc: fields,
-                    metadata: span.metadata(),
-                    depth: depth,
-                    color: color
-                }
             })
-        };
-
+        });
         return Id::from_non_zero_u64(id);
     }
 
@@ -298,50 +303,37 @@ impl Subscriber for DelayedLogger {
 
     fn event(&self, event: &Event<'_>) {
         if self.levels.contains(event.metadata().level()) {
-            let mut is_within_depth = false;
-            let mut color = None;
-            if let Some(span) = self.base.span_stack().borrow().last().copied() {
-                self.base.span_data(span, |data, _, _| if data.depth < self.max_depth {
-                    is_within_depth = true;
-                    color = data.color;
-                });
+            if let Some(span) = self.base.current_span() {
+                let is_within_depth = self.base.with_span(span, |span| matches!(span, SpanView::Tracked(data) if data.depth < self.max_depth));
                 if is_within_depth {
-                    let mut fields = FieldRecorder::new();
-                    event.record(&mut fields);
-                    self.base.send_message(colorize(color, fields.to_string()), span);
+                    self.base.send_message(span, |_| {
+                        let mut fields = FieldRecorder::new();
+                        event.record(&mut fields);
+                        Message::Event(fields.to_string())
+                    });
                 }
             } else {
                 let mut fields = FieldRecorder::new();
                 event.record(&mut fields);
-                PrintToStdout(fields.to_string())
+                print_to_stdout(&fields.to_string())
             }
         }
     }
 
     fn enter(&self, span: &Id) {
-        self.base.enter(span.into_non_zero_u64());
-        let mut message = None;
-        self.base.span_data(span.into_non_zero_u64(), |data, _, _| if data.depth < self.max_depth {
-            message = Some(colorize(data.color, data.desc.clone().to_string()));
-        } else if data.depth == self.max_depth {
-            message = Some(colorize(data.color, format!("{}...", data.desc)));
+        let span = span.into_non_zero_u64();
+        self.base.enter(span);
+        self.base.send_message(span, |data| if data.depth < self.max_depth {
+            Message::Enter
+        } else {
+            Message::EnterTruncated
         });
-        if let Some(message) = message {
-            self.base.send_message(message, span.into_non_zero_u64());
-        }
     }
 
     fn exit(&self, span: &Id) {
-        let mut message = None;
-        self.base.span_data(span.into_non_zero_u64(), |data, _, running_time| if data.depth == 0 {
-            message = Some(format!("done({} us)\n", running_time.as_micros()));
-        } else if data.depth <= self.max_depth {
-            message = Some(colorize(data.color, format!("done({} us)", running_time.as_micros())));
-        });
-        if let Some(message) = message {
-            self.base.send_message(message, span.into_non_zero_u64());
-        }
-        self.base.exit(span.into_non_zero_u64())
+        let span = span.into_non_zero_u64();
+        self.base.send_message(span, |_| Message::Exit(self.base.running_time(span)));
+        self.base.exit(span)
     }
 
     fn clone_span(&self, id: &Id) -> Id {
@@ -352,4 +344,36 @@ impl Subscriber for DelayedLogger {
     fn try_close(&self, id: Id) -> bool {
         self.base.delete_span(id.into_non_zero_u64())
     }
+}
+
+#[cfg(test)]
+#[tracing::instrument(skip_all, level = "trace")]
+fn test_recursion(depth: usize) -> usize {
+    tracing::event!(Level::INFO, depth);
+    assert!(!tracing::Span::current().is_none());
+    if depth == 0 {
+        0
+    } else {
+        test_recursion(depth - 1) + test_recursion(depth - 1)
+    }
+}
+
+#[test]
+fn test_subscriber() {
+    let subscriber = DelayedLogger::new(2, 0, Level::ERROR..=Level::TRACE);
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::span!(Level::INFO, "root", value = 1);
+        span.in_scope(|| {
+            test_recursion(5);
+            let current = tracing::Span::current();
+            let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+            std::thread::scope(|s| {
+                s.spawn(|| tracing::dispatcher::with_default(&dispatch, ||
+                    tracing::span!(parent: &current, Level::INFO, "thread").in_scope(|| test_recursion(5))
+                ));
+            });
+            let explicit_root = tracing::span!(parent: None, Level::INFO, "explicit_root");
+            explicit_root.in_scope(|| test_recursion(1));
+        });
+    });
 }
