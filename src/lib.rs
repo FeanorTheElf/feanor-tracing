@@ -139,6 +139,13 @@ impl SpanData {
 ///    stream supports them; Furthermore, they can be disabled via the the `NO_COLOR`
 ///    and `CLICOLOR` environment variables.
 ///
+/// Limitations:
+///  - Contrary to what [`tracing`] allows in general, a span must not be entered from
+///    multiple threads concurrently; doing so will cause a panic. Instead, create a
+///    separate child span for each thread, e.g. via `span!(parent: &outer_span, ...)`.
+///    This only concerns spans within depth `max_depth`, but since that depends on the
+///    calling context, it is best to always follow this pattern.
+///
 pub struct DelayedLogger {
     base: DelayedLoggerImpl<SpanData, Metadata<'static>, Message, fn(&SpanData, Message)>,
     levels: RangeInclusive<Level>,
